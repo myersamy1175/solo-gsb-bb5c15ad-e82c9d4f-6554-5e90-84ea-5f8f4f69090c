@@ -15,7 +15,6 @@ name matches no rule, fall back to the default threshold.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Sequence
@@ -33,15 +32,14 @@ MATCH_MANY = "**"
 
 
 @lru_cache(maxsize=1024)
-def _segment_regex(segment: str) -> "re.Pattern[str]":
-    """Compile one template segment to an anchored regex.
+def _segment_pieces(segment: str) -> tuple[str, ...]:
+    """Split a template segment into the literal pieces between ``*`` tokens.
 
-    ``*`` matches any run of characters *within* the segment; everything
-    else is literal.  A segment never spans ``/`` because templates and
-    paths are matched segment by segment.
+    A segment without ``*`` yields a single piece (the whole segment);
+    consecutive ``*`` tokens yield empty pieces, which match the empty
+    string and are therefore skipped by the matcher.
     """
-    parts = [re.escape(piece) for piece in segment.split("*")]
-    return re.compile(".*".join(parts) + r"\Z")
+    return tuple(segment.split("*"))
 
 
 @dataclass(frozen=True)
@@ -64,13 +62,48 @@ class GateRule:
 def _segments_match(template_segment: str, path_segment: str) -> bool:
     """Match a single path segment against one template segment.
 
+    ``*`` matches any run of characters *within* the segment (possibly
+    empty); everything else is literal.  A segment never spans ``/``
+    because templates and paths are matched segment by segment.
+
+    Implemented as an ordered literal scan, not a regex: the first piece
+    must be a prefix, the last a suffix, and every middle piece is
+    located once, left to right, in the region between them.  Leftmost
+    placement is always safe -- placing a piece further right cannot
+    make an otherwise impossible match possible -- so each piece is
+    searched exactly once and the total work stays bounded (one substring
+    search per literal piece).  A template such as ``*a*a*...*a``
+    therefore cannot trigger the exponential backtracking a
+    ``.*a.*a...`` regex would.
+
     ``**`` also matches one segment here -- the zero-or-more-segments
     behaviour is handled by the segment-level dynamic program in
     :func:`_template_matches`.
     """
     if template_segment == MATCH_MANY:
         return True
-    return _segment_regex(template_segment).match(path_segment) is not None
+    pieces = _segment_pieces(template_segment)
+    if len(pieces) == 1:
+        # No ``*`` in the segment: literal (fixed) match.
+        return pieces[0] == path_segment
+    first, last = pieces[0], pieces[-1]
+    # The prefix and suffix pieces cannot share characters (the ``*``
+    # between them may match empty, but not a negative-length run).
+    if len(first) + len(last) > len(path_segment):
+        return False
+    if not path_segment.startswith(first) or not path_segment.endswith(last):
+        return False
+    pos = len(first)
+    limit = len(path_segment) - len(last)
+    for piece in pieces[1:-1]:
+        if not piece:
+            # Consecutive ``*`` tokens: empty piece matches anywhere.
+            continue
+        found = path_segment.find(piece, pos, limit)
+        if found < 0:
+            return False
+        pos = found + len(piece)
+    return True
 
 
 def _template_matches(

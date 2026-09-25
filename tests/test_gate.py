@@ -71,6 +71,18 @@ def _rules(specs):
         ("a/b", "a/b/", False),
         ("/a/b", "/a/b", True),
         ("*/b/*", "a/b/c", True),
+        ("a**b", "ab", True),                       # consecutive stars in a segment
+        ("a**b", "axxb", True),
+        ("x*a*y*z", "xayz", True),                  # * matches the empty string
+        ("x*a*y*z", "xaybz", True),
+        ("x*a*y*z", "xyz", False),                  # literal pieces must appear
+        ("x*a*y*z", "xaz", False),
+        ("x*y*z", "xyz", True),
+        ("*a*a*", "aa", True),
+        ("*a*a*", "a", False),
+        ("ab*ab", "ab", False),                     # prefix/suffix cannot overlap
+        ("ab*ab", "abab", True),
+        ("ab*ab", "abXab", True),
     ],
 )
 def test_template_matcher(template, path, matches):
@@ -111,9 +123,63 @@ def test_select_rule_no_match_returns_none():
     assert select_rule("a/b.py", _rules([("src/**", "low")])) is None
 
 
+def test_alternating_star_segment_stays_bounded():
+    # Regression: "*a*a*...*a*b" used to compile to a regex whose
+    # backtracking grew exponentially in the number of '*' tokens, so a
+    # single rule could stall the whole gate batch on a long run of 'a'
+    # that ultimately does not match.  Matching must stay bounded and
+    # the non-matching record must fall back to the default threshold.
+    template = "*a" * 64 + "*b"
+    rules = _rules([(template, "critical")])
+
+    miss = evaluate_record(
+        {"id": 1, "filename": "a" * 500, "risk_level": "high"},
+        default_max_risk="low",
+        rules=rules,
+    )
+    assert miss["matched_rule"] is None
+    assert miss["used_default"] is True
+    assert miss["threshold"] == "low"
+    assert miss["passed"] is False
+
+    hit = evaluate_record(
+        {"id": 2, "filename": "a" * 500 + "b", "risk_level": "critical"},
+        default_max_risk="low",
+        rules=rules,
+    )
+    assert hit["matched_rule"] == {
+        "index": 0, "template": template, "max_risk": "critical"
+    }
+    assert hit["used_default"] is False
+    assert hit["threshold"] == "critical"
+    assert hit["passed"] is True
+
+
 # ---------------------------------------------------------------------------
 # API tests
 # ---------------------------------------------------------------------------
+
+def test_gate_alternating_star_segment_via_api(client):
+    # Same adversarial shape through the endpoint: the batch returns
+    # promptly, the unmatched record uses the default threshold and the
+    # matched record keeps its rule threshold.
+    template = "*a" * 64 + "*b"
+    miss = _post(client, HIGH_RISK, "a" * 500).json()["id"]
+    hit = _post(client, CRITICAL_RISK, "a" * 500 + "b").json()["id"]
+    body = _gate(
+        client, [miss, hit], "low",
+        rules=[{"template": template, "max_risk": "critical"}],
+    ).json()
+    by_id = {item["id"]: item for item in body["results"]}
+    assert by_id[miss]["matched_rule"] is None
+    assert by_id[miss]["used_default"] is True
+    assert by_id[miss]["threshold"] == "low"
+    assert by_id[miss]["passed"] is False
+    assert by_id[hit]["matched_rule"]["template"] == template
+    assert by_id[hit]["threshold"] == "critical"
+    assert by_id[hit]["passed"] is True
+    assert body["passed"] is False
+
 
 def test_gate_missing_record_is_404(client):
     audit_id = _post(client, CLEAN, "a.txt").json()["id"]
