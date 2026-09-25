@@ -1,5 +1,7 @@
 """API tests for POST /api/v1/audits/gate (path-based risk gate)."""
 
+import time
+
 import pytest
 
 LRE = "‪"
@@ -35,6 +37,7 @@ def _gate(client, ids, default_max_risk, rules=None):
 # ---------------------------------------------------------------------------
 
 from app.gate import GateRule, evaluate_record, select_rule  # noqa: E402
+from app.gate import _segments_match  # noqa: E402
 
 
 def _rules(specs):
@@ -42,6 +45,89 @@ def _rules(specs):
         GateRule.make(index=i, template=template, max_risk=max_risk)
         for i, (template, max_risk) in enumerate(specs)
     ]
+
+
+@pytest.mark.parametrize(
+    "template_segment,path_segment,matches",
+    [
+        # "*" matches any run within one segment, including the empty run
+        ("*", "", True),
+        ("*", "anything", True),
+        ("*", "a/b", False),
+        # the star may match the empty string, not just a non-empty run;
+        # literal letters are still required on both sides of a middle star
+        ("a*", "a", True),
+        ("*a", "a", True),
+        ("a*a", "a", False),
+        ("a*a", "aba", True),
+        ("a*a", "ab", False),
+        # consecutive stars are equivalent to a single star
+        ("a**", "a", True),
+        ("a**", "abc", True),
+        ("**a", "za", True),
+        ("a**b**c", "axbyc", True),
+        ("a**b**c", "ac", False),
+        ("a**b**c", "axc", False),
+        # every character outside "*" is literal, "." is not a regex wildcard
+        ("*.py", ".py", True),
+        ("*.py", "x.py", True),
+        ("*.py", "xpy", False),
+        ("a.c", "a.c", True),
+        ("a.c", "axc", False),
+        # inner literal runs must all appear in order, separated only by
+        # whatever the stars consume
+        ("*a*b", "aabb", True),
+        ("*a*b", "aaa", False),
+        ("*ab*bc*", "abbc", True),
+        ("*a*ab*", "aab", True),
+        # literal only segment
+        ("abc", "abc", True),
+        ("abc", "xabc", False),
+        ("abc", "abcx", False),
+    ],
+)
+def test_segment_glob_matcher(template_segment, path_segment, matches):
+    assert _segments_match(template_segment, path_segment) is matches
+
+
+def test_segment_match_is_bounded_under_alternating_stars():
+    # "*a"*k compiled naively to ".*a"*k exhibits exponential backtracking
+    # on a long run of "a" with a mismatching tail; the bounded matcher must
+    # decide in milliseconds regardless of the input size.
+    k = 4000
+    template_segment = "*a" * k
+    adversarial = "a" * k + "!"
+    exact = "a" * k
+    short = "a" * (k // 2)
+
+    start = time.perf_counter()
+    assert _segments_match(template_segment, adversarial) is False
+    assert _segments_match(template_segment, exact) is True
+    assert _segments_match(template_segment, short) is False
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"segment matcher took {elapsed:.3f}s"
+
+
+def test_single_alternating_rule_does_not_slow_down_batch(client):
+    # end-to-end: one adversarial rule over a batch must stay fast and fall
+    # back to the default threshold for the non-matching record.  k=2000
+    # gives a 4000-char template (within the 4096 request limit); a naive
+    # ".*a" regex of this size cannot finish in any practical time.
+    k = 2000
+    rule = [{"template": "*a" * k, "max_risk": "info"}]
+    target = _post(client, CLEAN, "a" * k + "!").json()["id"]
+    other = _post(client, CLEAN, "a" * k).json()["id"]
+
+    start = time.perf_counter()
+    body = _gate(client, [target, other], "high", rules=rule).json()
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"gate batch took {elapsed:.3f}s"
+
+    by_id = {item["id"]: item for item in body["results"]}
+    assert by_id[target]["used_default"] is True
+    assert by_id[target]["threshold"] == "high"
+    assert by_id[other]["matched_rule"]["template"] == "*a" * k
+    assert by_id[other]["threshold"] == "info"
 
 
 @pytest.mark.parametrize(

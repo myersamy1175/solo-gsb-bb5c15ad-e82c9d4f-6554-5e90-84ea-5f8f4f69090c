@@ -3,9 +3,13 @@
 Given a default maximum tolerated risk and an ordered list of path rules,
 each record is matched against the file name stored on it.  Rule templates
 are split on ``/`` into segments.  Within a segment, ``*`` matches any run
-of characters but never crosses ``/`` (so ``*.py`` matches one segment);
-a standalone ``**`` segment matches zero or more whole segments.  Segments
-without ``*`` are literal (fixed) matches.
+of characters, including the empty string, but never crosses ``/`` (so
+``*.py`` matches one segment); a standalone ``**`` segment matches zero or
+more whole segments.  Segments without ``*`` are literal (fixed) matches.
+
+Within-segment matching is a backtracking-free glob match with bounded
+worst-case cost, so adversarial templates (many alternating ``*a``) with
+non-matching file names cannot trigger exponential backtracking.
 
 When several rules match a path the most specific one wins: first by the
 number of literal (fixed) segments, then by the total number of template
@@ -15,9 +19,7 @@ name matches no rule, fall back to the default threshold.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Optional, Sequence
 
 RISK_ORDER = {
@@ -30,18 +32,6 @@ RISK_ORDER = {
 
 # Wildcard segment token for "zero or more segments".
 MATCH_MANY = "**"
-
-
-@lru_cache(maxsize=1024)
-def _segment_regex(segment: str) -> "re.Pattern[str]":
-    """Compile one template segment to an anchored regex.
-
-    ``*`` matches any run of characters *within* the segment; everything
-    else is literal.  A segment never spans ``/`` because templates and
-    paths are matched segment by segment.
-    """
-    parts = [re.escape(piece) for piece in segment.split("*")]
-    return re.compile(".*".join(parts) + r"\Z")
 
 
 @dataclass(frozen=True)
@@ -62,15 +52,58 @@ class GateRule:
 
 
 def _segments_match(template_segment: str, path_segment: str) -> bool:
-    """Match a single path segment against one template segment.
+    """Match one path segment against one template segment.
 
-    ``**`` also matches one segment here -- the zero-or-more-segments
+    ``**`` matches any single segment here -- the zero-or-more-segments
     behaviour is handled by the segment-level dynamic program in
-    :func:`_template_matches`.
+    :func:`_template_matches`.  Otherwise ``*`` matches any run of
+    characters *within* the segment, including the empty run, and every
+    other character (including ``.``) is literal.
+
+    Uses the star-pointer (single-backtrack-point) glob algorithm with
+    bounded worst-case cost O(template length * segment length): when a
+    literal run fails, matching resumes from the most recent star, which
+    then owns one more character, so there is no exponential fan-out of
+    splits.  A template such as ``*a*a*a`` against a long run of ``a``
+    with a mismatching tail is decided in linear time rather than
+    exploring exponentially many ways to divide the run between stars.
+
+    A path segment never contains ``/`` (templates and paths are split on
+    ``/`` before this is called); the explicit guard keeps that
+    invariant even if the helper is used directly.
     """
+    if "/" in path_segment:
+        return False
     if template_segment == MATCH_MANY:
         return True
-    return _segment_regex(template_segment).match(path_segment) is not None
+
+    template = template_segment
+    segment = path_segment
+    tlen, slen = len(template), len(segment)
+    pi = 0          # cursor in the template
+    si = 0          # cursor in the path segment
+    star_pi = -1    # index of the most recent "*" in the template
+    star_si = 0     # segment position that star has consumed up to
+
+    while si < slen:
+        if pi < tlen and template[pi] == "*":
+            star_pi = pi
+            star_si = si
+            pi += 1
+        elif pi < tlen and template[pi] == segment[si]:
+            pi += 1
+            si += 1
+        elif star_pi >= 0:
+            # Literal run failed: hand one more character to the most
+            # recent star and retry the run from after it.
+            pi = star_pi + 1
+            star_si += 1
+            si = star_si
+        else:
+            return False
+
+    # Any template characters left over must all be empty-matching stars.
+    return all(template[i] == "*" for i in range(pi, tlen))
 
 
 def _template_matches(
